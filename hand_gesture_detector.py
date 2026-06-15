@@ -53,9 +53,9 @@ def is_thumb_raised(landmarks):
     """
     Determine if the thumb is raised or folded.
     
-    The thumb is detected differently from other fingers because it moves
-    horizontally rather than vertically. We check if the thumb tip is further
-    from the wrist along the x-axis.
+    The thumb is detected differently from other fingers because it can move
+    horizontally, vertically, or diagonally depending on wrist rotation. This
+    uses multiple thumb and palm landmarks instead of one x-coordinate check.
     
     Args:
         landmarks: Hand landmarks from MediaPipe
@@ -63,15 +63,45 @@ def is_thumb_raised(landmarks):
     Returns:
         bool: True if thumb is raised, False if folded
     """
-    # Thumb tip index: 4
-    # Thumb IP joint index: 3
-    # For thumb, we check x-position instead of y-position
-    thumb_tip_x = landmarks[4].x
-    thumb_ip_x = landmarks[3].x
-    
-    # If thumb tip is further from center (larger or smaller x depending on hand),
-    # we check if tip x is less than IP x (thumb extended outward from hand)
-    return thumb_tip_x < thumb_ip_x
+    def distance(point_a, point_b):
+        return ((point_a.x - point_b.x) ** 2 + (point_a.y - point_b.y) ** 2) ** 0.5
+
+    wrist = landmarks[0]
+    thumb_mcp = landmarks[2]
+    thumb_ip = landmarks[3]
+    thumb_tip = landmarks[4]
+    index_mcp = landmarks[5]
+    middle_mcp = landmarks[9]
+    pinky_mcp = landmarks[17]
+
+    palm_center = type("Point", (), {
+        "x": (wrist.x + index_mcp.x + pinky_mcp.x) / 3,
+        "y": (wrist.y + index_mcp.y + pinky_mcp.y) / 3
+    })()
+    hand_scale = max(distance(wrist, middle_mcp), 0.001)
+
+    tip_to_palm = distance(thumb_tip, palm_center)
+    ip_to_palm = distance(thumb_ip, palm_center)
+    tip_to_wrist = distance(thumb_tip, wrist)
+    ip_to_wrist = distance(thumb_ip, wrist)
+    tip_to_index = distance(thumb_tip, index_mcp)
+    ip_to_index = distance(thumb_ip, index_mcp)
+    thumb_extension = distance(thumb_tip, thumb_mcp)
+
+    tucked_thumb = (tip_to_index < 0.45 * hand_scale and
+                    tip_to_palm < ip_to_palm + 0.04 * hand_scale)
+
+    extension_score = 0
+    if tip_to_palm > ip_to_palm + 0.10 * hand_scale:
+        extension_score += 1
+    if tip_to_wrist > ip_to_wrist + 0.08 * hand_scale:
+        extension_score += 1
+    if tip_to_index > ip_to_index + 0.06 * hand_scale:
+        extension_score += 1
+    if thumb_extension > 0.35 * hand_scale:
+        extension_score += 1
+
+    return extension_score >= 3 and not tucked_thumb
 
 
 def detect_raised_fingers(hand_landmarks):
@@ -239,6 +269,87 @@ def is_thumbs_up(fingers_status):
             not fingers_status['pinky'])
 
 
+def is_thumb_only_pose(fingers_status, landmarks=None):
+    """
+    Detect whether the hand is making a thumb-only pose.
+
+    This reuses the existing finger-status architecture and adds an optional
+    landmark distance check so Thumbs Down can be detected even when the thumb
+    is pointing vertically instead of horizontally.
+    """
+    if not fingers_status:
+        return False
+
+    other_fingers_folded = (not fingers_status['index'] and
+                            not fingers_status['middle'] and
+                            not fingers_status['ring'] and
+                            not fingers_status['pinky'])
+
+    if not other_fingers_folded:
+        return False
+
+    if landmarks is None:
+        return fingers_status['thumb']
+
+    wrist = landmarks[0]
+    thumb_mcp = landmarks[2]
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+
+    tip_distance = ((thumb_tip.x - wrist.x) ** 2 + (thumb_tip.y - wrist.y) ** 2) ** 0.5
+    ip_distance = ((thumb_ip.x - wrist.x) ** 2 + (thumb_ip.y - wrist.y) ** 2) ** 0.5
+    thumb_extension = ((thumb_tip.x - thumb_mcp.x) ** 2 + (thumb_tip.y - thumb_mcp.y) ** 2) ** 0.5
+
+    return fingers_status['thumb'] or (tip_distance > ip_distance + 0.02 and
+                                       thumb_extension > 0.08)
+
+
+def is_thumbs_down(fingers_status, landmarks=None):
+    """
+    Detect Thumbs Down gesture: Thumb-only pose with thumb pointing down.
+
+    Pattern: Thumb extended downward, all other fingers folded
+    Use case: Negative acknowledgment
+
+    Args:
+        fingers_status: Dictionary containing finger statuses
+        landmarks: Optional MediaPipe hand landmarks for thumb direction
+
+    Returns:
+        bool: True if thumbs down detected, False otherwise
+    """
+    if not is_thumb_only_pose(fingers_status, landmarks):
+        return False
+
+    if landmarks is None:
+        return False
+
+    thumb_cmc = landmarks[1]
+    thumb_mcp = landmarks[2]
+    thumb_ip = landmarks[3]
+    thumb_tip = landmarks[4]
+
+    thumb_down_score = 0
+
+    if thumb_tip.y > thumb_ip.y + 0.02:
+        thumb_down_score += 1
+    if thumb_tip.y > thumb_mcp.y + 0.04:
+        thumb_down_score += 1
+    if thumb_tip.y > thumb_cmc.y + 0.03:
+        thumb_down_score += 1
+    if thumb_ip.y > thumb_mcp.y - 0.02:
+        thumb_down_score += 1
+
+    thumb_vector_y = thumb_tip.y - thumb_mcp.y
+    thumb_vector_x = abs(thumb_tip.x - thumb_mcp.x)
+    allows_moderate_rotation = thumb_vector_y > 0.035 and thumb_vector_y > thumb_vector_x * 0.25
+
+    if allows_moderate_rotation:
+        thumb_down_score += 1
+
+    return thumb_down_score >= 4
+
+
 def is_peace_sign(fingers_status):
     """
     Detect Peace Sign gesture: Index and middle fingers raised.
@@ -285,7 +396,7 @@ def is_rock_sign(fingers_status):
             fingers_status['pinky'])
 
 
-def detect_gesture(fingers_status):
+def detect_gesture(fingers_status, landmarks=None):
     """
     Detect hand gesture from finger configuration.
     
@@ -295,13 +406,15 @@ def detect_gesture(fingers_status):
     
     Gesture Priority (checked in order):
     1. Open Palm - all five fingers raised
-    2. Fist - all fingers folded
-    3. Thumbs Up - only thumb raised
-    4. Peace Sign - index and middle raised
-    5. Rock Sign - index and pinky raised
+    2. Thumbs Down - thumb-only pose pointing down
+    3. Fist - all fingers folded
+    4. Thumbs Up - only thumb raised
+    5. Peace Sign - index and middle raised
+    6. Rock Sign - index and pinky raised
     
     Args:
         fingers_status: Dictionary containing finger statuses
+        landmarks: Optional MediaPipe hand landmarks for orientation-aware gestures
     
     Returns:
         str: Name of the detected gesture or "Unknown Gesture"
@@ -312,6 +425,8 @@ def detect_gesture(fingers_status):
     # Check gestures in priority order
     if is_open_palm(fingers_status):
         return "Open Palm"
+    elif is_thumbs_down(fingers_status, landmarks):
+        return "Thumbs Down"
     elif is_fist(fingers_status):
         return "Fist"
     elif is_thumbs_up(fingers_status):
@@ -343,6 +458,7 @@ def draw_gesture_display(frame, gesture_name):
         'Open Palm': (0, 255, 255),      # Cyan - stop/greeting
         'Fist': (0, 0, 255),              # Red - closed hand
         'Thumbs Up': (0, 255, 0),         # Green - positive
+        'Thumbs Down': (0, 165, 255),      # Orange - negative
         'Peace Sign': (255, 0, 255),      # Magenta - victory
         'Rock Sign': (255, 0, 0),         # Blue - rock on
         'Unknown Gesture': (128, 128, 128) # Gray - unrecognized
@@ -399,17 +515,23 @@ class GestureStabilizer:
     for a minimum consecutive frame count.
     """
     
-    def __init__(self, confidence_frames=10):
+    def __init__(self, confidence_frames=10, gesture_confidence_frames=None):
         """
         Initialize the gesture stabilizer.
         
         Args:
             confidence_frames: Number of consecutive frames required for gesture confirmation
+            gesture_confidence_frames: Optional per-gesture confirmation thresholds
         """
         self.confidence_frames = confidence_frames
+        self.gesture_confidence_frames = gesture_confidence_frames or {}
         self.current_gesture = "Unknown Gesture"
         self.confirmed_gesture = "Unknown Gesture"
         self.frame_count = 0
+
+    def get_required_frames(self, gesture_name):
+        """Get the confirmation threshold for the given gesture."""
+        return self.gesture_confidence_frames.get(gesture_name, self.confidence_frames)
     
     def update(self, detected_gesture):
         """
@@ -428,21 +550,23 @@ class GestureStabilizer:
             str: Confirmed gesture to display (or "Unknown Gesture" if not yet confirmed)
         """
         # Check if detected gesture is the same as current tracked gesture
+        required_frames = self.get_required_frames(detected_gesture)
         if detected_gesture == self.current_gesture:
             # Increment frame counter for consistent detection
             self.frame_count += 1
             
             # Once we reach confidence threshold, confirm the gesture
-            if self.frame_count >= self.confidence_frames:
+            if self.frame_count >= required_frames:
                 self.confirmed_gesture = detected_gesture
         else:
             # Gesture changed, reset tracking to new gesture
             self.current_gesture = detected_gesture
             self.frame_count = 1  # Start counting from 1 (current frame)
+            required_frames = self.get_required_frames(self.current_gesture)
             
             # Only update confirmed gesture if we were detecting something stable
             # Otherwise keep the previous confirmed gesture for 1-2 frames of stability
-            if self.frame_count < self.confidence_frames:
+            if self.frame_count < required_frames:
                 # Gesture is in transition, potentially keep showing previous gesture
                 # or show "Detecting..." - decided to keep previous for smooth UX
                 pass
@@ -458,7 +582,8 @@ class GestureStabilizer:
         Returns:
             tuple: (confirmed_gesture, current_frame_count, progress_percentage)
         """
-        progress = min(100, (self.frame_count / self.confidence_frames) * 100)
+        required_frames = self.get_required_frames(self.current_gesture)
+        progress = min(100, (self.frame_count / required_frames) * 100)
         return self.confirmed_gesture, self.frame_count, int(progress)
     
     def reset(self):
@@ -482,6 +607,7 @@ def draw_gesture_progress(frame, gesture_stabilizer):
     """
     confirmed, frame_count, progress = gesture_stabilizer.get_confirmation_status()
     current = gesture_stabilizer.current_gesture
+    required_frames = gesture_stabilizer.get_required_frames(current)
     
     # Only show progress if we're not at a confirmed gesture or if we're detecting something new
     if current != "Unknown Gesture" and current != confirmed:
@@ -495,7 +621,7 @@ def draw_gesture_progress(frame, gesture_stabilizer):
         y = 80
         
         # Draw detecting text
-        detecting_text = f"Detecting: {current} ({frame_count}/10)"
+        detecting_text = f"Detecting: {current} ({frame_count}/{required_frames})"
         cv2.putText(
             frame,
             detecting_text,
@@ -696,6 +822,43 @@ def show_desktop_notification(title, message, duration=3):
         error_msg = f"Notification error: {e}"
         print(error_msg)
         return False, error_msg
+
+
+# ============================================================================
+# WINDOWS SYSTEM VOLUME CONTROL
+# ============================================================================
+# Uses Windows media volume keys so the native Windows volume flyout appears.
+
+def increase_volume():
+    """Increase the actual Windows system volume."""
+    previous_failsafe = pyautogui.FAILSAFE
+    try:
+        pyautogui.FAILSAFE = False
+        pyautogui.press("volumeup")
+    finally:
+        pyautogui.FAILSAFE = previous_failsafe
+
+
+def decrease_volume():
+    """Decrease the actual Windows system volume."""
+    previous_failsafe = pyautogui.FAILSAFE
+    try:
+        pyautogui.FAILSAFE = False
+        pyautogui.press("volumedown")
+    finally:
+        pyautogui.FAILSAFE = previous_failsafe
+
+
+def toggle_play_pause():
+    """Toggle playback for media apps that support Windows media controls."""
+    previous_failsafe = pyautogui.FAILSAFE
+    try:
+        pyautogui.FAILSAFE = False
+        pyautogui.press("playpause")
+    finally:
+        pyautogui.FAILSAFE = previous_failsafe
+
+
 # ============================================================================
 # MEDIAPIPE INITIALIZATION
 # ============================================================================
@@ -742,7 +905,10 @@ prev_time = 0
 current_time = 0
 
 # Initialize gesture stabilizer to require consistent detection for 10 frames
-gesture_stabilizer = GestureStabilizer(confidence_frames=10)
+gesture_stabilizer = GestureStabilizer(
+    confidence_frames=10,
+    gesture_confidence_frames={"Thumbs Down": 5}
+)
 
 # ============================================================================
 # SCREENSHOT AND GESTURE ACTION SETUP
@@ -750,6 +916,14 @@ gesture_stabilizer = GestureStabilizer(confidence_frames=10)
 # Create Screenshots folder and initialize screenshot manager
 screenshots_folder = ensure_screenshots_folder()
 screenshot_manager = ScreenshotManager(cooldown_seconds=3.0)
+
+# Volume gesture cooldown setup
+volume_cooldown_seconds = 0.3
+last_volume_change_time = 0
+
+# Media play/pause cooldown setup
+media_cooldown_seconds = 2.0
+last_media_toggle_time = 0
 
 while True:
     # Read frame from webcam
@@ -804,7 +978,7 @@ while True:
             # RECOGNIZE GESTURE
             # ================================================================
             # Use finger status to identify the hand gesture
-            detected_gesture = detect_gesture(fingers_status)
+            detected_gesture = detect_gesture(fingers_status, hand_landmarks.landmark)
     
     # ========================================================================
     # STABILIZE GESTURE DETECTION
@@ -836,6 +1010,32 @@ while True:
         elif error != "Cooldown active":
             # Some other error occurred (not just cooldown)
             print(f"Screenshot error: {error}")
+
+    # ========================================================================
+    # GESTURE-BASED ACTIONS - VOLUME CONTROL
+    # ========================================================================
+    # Thumbs Up and Thumbs Down send native Windows volume key events.
+    if confirmed_gesture in ("Thumbs Up", "Thumbs Down"):
+        current_time_for_volume = time.time()
+        if current_time_for_volume - last_volume_change_time >= volume_cooldown_seconds:
+            if confirmed_gesture == "Thumbs Up":
+                increase_volume()
+                print("Volume increased")
+            elif confirmed_gesture == "Thumbs Down":
+                decrease_volume()
+                print("Volume decreased")
+            last_volume_change_time = current_time_for_volume
+
+    # ========================================================================
+    # GESTURE-BASED ACTIONS - MEDIA PLAY/PAUSE
+    # ========================================================================
+    # Fist sends the native Windows Play/Pause media key event.
+    if confirmed_gesture == "Fist":
+        current_time_for_media = time.time()
+        if current_time_for_media - last_media_toggle_time >= media_cooldown_seconds:
+            toggle_play_pause()
+            print("Media play/pause toggled")
+            last_media_toggle_time = current_time_for_media
     
     # ========================================================================
     # CALCULATE AND DISPLAY FPS
